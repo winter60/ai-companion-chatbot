@@ -859,11 +859,22 @@ export default function ChatPage() {
   const signOut = async () => {
     try {
       const { error } = await supabase.auth.signOut()
-      if (error) {
+      if (error && error.message !== 'Auth session missing!') {
         console.error('Error signing out:', error.message)
+      } else {
+        // 即使出现 Auth session missing 错误，也清除本地状态
+        setUser(null)
+        setMessages([])
+        setShowPersonalitySelector(true)
+        setLoadingMessages(false)
       }
     } catch (error) {
       console.error('Error signing out:', error)
+      // 发生任何错误都清除本地状态
+      setUser(null)
+      setMessages([])
+      setShowPersonalitySelector(true)
+      setLoadingMessages(false)
     }
   }
 
