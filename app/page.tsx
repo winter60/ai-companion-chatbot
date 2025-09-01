@@ -5,10 +5,11 @@ import type React from "react"
 import { useState, useEffect, useRef } from "react"
 import { Button } from "@/components/ui/button"
 import { supabase } from "@/lib/supabaseClient"
+import { getOrCreateGuestDeviceId, collectDeviceFingerprint } from "@/lib/deviceFingerprint"
 import { Input } from "@/components/ui/input"
 import { Card } from "@/components/ui/card"
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar"
-import { Send, Heart, Users, Brain, Sparkles, Languages, Volume2, VolumeX, Loader2, LogIn, LogOut } from "lucide-react"
+import { Send, Heart, Users, Brain, Sparkles, Languages, Volume2, VolumeX, Loader2, LogIn, LogOut, Crown } from "lucide-react"
 import { type User } from '@supabase/supabase-js'
 
 interface Message {
@@ -314,18 +315,52 @@ const personalities: Personality[] = [
   },
 ]
 
-const generateAIResponse = async (
+interface AIResponseResult {
+  response: string
+  remaining?: number
+  isGuest?: boolean
+  error?: string
+  limitReached?: boolean
+}
+
+const generateAIResponseStream = async (
   userMessage: string,
   conversationHistory: Message[],
   personality: PersonalityType,
   language: "zh" | "en",
-): Promise<string> => {
+  user: any = null,
+  deviceId: string = "",
+  onContent: (content: string) => void,
+  onComplete: (metadata: { remaining: number, isGuest: boolean }) => void,
+  onError: (error: string) => void
+): Promise<void> => {
   try {
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+    }
+    
+    // Add authorization header if user is logged in
+    if (user) {
+      const { data: { session } } = await supabase.auth.getSession()
+      if (session?.access_token) {
+        headers.Authorization = `Bearer ${session.access_token}`
+      }
+    } else if (deviceId) {
+      // 添加设备指纹头部信息（访客用户）
+      headers['x-device-id'] = deviceId
+      
+      // 收集并发送完整指纹
+      try {
+        const fingerprint = collectDeviceFingerprint()
+        headers['x-device-fingerprint'] = JSON.stringify(fingerprint)
+      } catch (error) {
+        console.warn("Could not collect device fingerprint for chat:", error)
+      }
+    }
+
     const response = await fetch("/api/chat", {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
+      headers,
       body: JSON.stringify({
         message: userMessage,
         personality,
@@ -335,79 +370,70 @@ const generateAIResponse = async (
     })
 
     if (!response.ok) {
-      throw new Error("API request failed")
-    }
-
-    const data = await response.json()
-    return data.response
-  } catch (error) {
-    console.error("Error calling chat API:", error)
-
-    const emotions = {
-      sad: [
-        "sad",
-        "depressed",
-        "down",
-        "upset",
-        "crying",
-        "lonely",
-        "empty",
-        "难过",
-        "沮丧",
-        "伤心",
-        "哭",
-        "孤独",
-        "空虚",
-      ],
-      anxious: [
-        "anxious",
-        "worried",
-        "nervous",
-        "scared",
-        "panic",
-        "stress",
-        "焦虑",
-        "担心",
-        "紧张",
-        "害怕",
-        "恐慌",
-        "压力",
-      ],
-      angry: ["angry", "mad", "frustrated", "annoyed", "furious", "生气", "愤怒", "沮丧", "烦恼", "暴怒"],
-      happy: [
-        "happy",
-        "good",
-        "great",
-        "excited",
-        "joy",
-        "wonderful",
-        "开心",
-        "高兴",
-        "好",
-        "棒",
-        "兴奋",
-        "快乐",
-        "美好",
-      ],
-      tired: ["tired", "exhausted", "drained", "sleepy", "worn out", "累", "疲惫", "疲劳", "困", "精疲力竭"],
-    }
-
-    const lowerMessage = userMessage.toLowerCase()
-    let detectedEmotion = "neutral"
-
-    for (const [emotion, keywords] of Object.entries(emotions)) {
-      if (keywords.some((keyword) => lowerMessage.includes(keyword))) {
-        detectedEmotion = emotion
-        break
+      if (response.status === 429) {
+        // Try to parse JSON error response
+        try {
+          const errorData = await response.json()
+          onError(errorData.error || "Rate limit exceeded")
+          return
+        } catch {
+          onError("Rate limit exceeded")
+          return
+        }
       }
+      onError(`API request failed: ${response.status}`)
+      return
     }
 
-    const selectedPersonality = personalities.find((p) => p.id === personality)!
-    const responseOptions =
-      selectedPersonality.responses[detectedEmotion]?.[language] || selectedPersonality.responses.neutral[language]
-    const randomIndex = Math.floor(Math.random() * responseOptions.length)
+    // Handle streaming response
+    const reader = response.body?.getReader()
+    if (!reader) {
+      onError("No response stream available")
+      return
+    }
 
-    return responseOptions[randomIndex]
+    const decoder = new TextDecoder()
+    let buffer = ''
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read()
+        
+        if (done) break
+
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split('\n')
+        buffer = lines.pop() || ''
+
+        for (const line of lines) {
+          if (line.trim().startsWith('data: ')) {
+            try {
+              const jsonStr = line.replace('data: ', '').trim()
+              const data = JSON.parse(jsonStr)
+              
+              if (data.type === 'content' && data.content) {
+                onContent(data.content)
+              } else if (data.type === 'metadata') {
+                onComplete({
+                  remaining: data.remaining || 0,
+                  isGuest: data.isGuest || false
+                })
+              } else if (data.type === 'error') {
+                onError(data.error || 'Unknown error occurred')
+                return
+              }
+            } catch (parseError) {
+              console.error('Error parsing stream data:', parseError)
+            }
+          }
+        }
+      }
+    } finally {
+      reader.releaseLock()
+    }
+  } catch (error) {
+    console.error("Error calling streaming chat API:", error)
+    onError("网络连接错误，请重试")
   }
 }
 
@@ -551,11 +577,121 @@ export default function ChatPage() {
   const [user, setUser] = useState<User | null>(null)
   const [loading, setLoading] = useState(true)
   const [loadingMessages, setLoadingMessages] = useState(false)
+  const [remainingCount, setRemainingCount] = useState<number>(0)
+  const [isGuest, setIsGuest] = useState<boolean>(false)
+  const [limitReached, setLimitReached] = useState<boolean>(false)
+  const [guestDeviceId, setGuestDeviceId] = useState<string>("")
+  const [trackingMethod, setTrackingMethod] = useState<string>("device_fingerprint")
+  const [userPlan, setUserPlan] = useState<string>("free")
+  const [planExpires, setPlanExpires] = useState<Date | null>(null)
+  const [dailyLimit, setDailyLimit] = useState<number>(0)
+  const [streamingMessage, setStreamingMessage] = useState<string>("")
+  const [streamingMessageId, setStreamingMessageId] = useState<string | null>(null)
   const audioRef = useRef<HTMLAudioElement | null>(null)
+  const messagesEndRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
     setIsMounted(true)
   }, [])
+
+  // 初始化设备指纹（仅在客户端）
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      try {
+        const deviceId = getOrCreateGuestDeviceId()
+        setGuestDeviceId(deviceId)
+        console.log("[Client] Device ID initialized:", deviceId.substring(0, 16) + '...')
+      } catch (error) {
+        console.error("[Client] Error initializing device ID:", error)
+        // 降级方案：使用时间戳生成临时ID
+        setGuestDeviceId(`temp_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 8)}`)
+      }
+    }
+  }, [])
+
+  // Function to fetch user subscription info
+  const fetchUserSubscription = async () => {
+    if (!user) return
+
+    try {
+      const { data: activeSubscription, error } = await supabase.rpc('get_user_active_subscription', {
+        p_user_id: user.id
+      })
+
+      if (error) {
+        console.error('Error fetching subscription:', error)
+        return
+      }
+
+      if (activeSubscription && activeSubscription.length > 0) {
+        const sub = activeSubscription[0]
+        setUserPlan(sub.plan_type)
+        setPlanExpires(sub.expires_at ? new Date(sub.expires_at) : null)
+        setDailyLimit(sub.daily_limit)
+      } else {
+        // 获取用户profile信息作为后备
+        const { data: profile } = await supabase
+          .from('profiles')
+          .select('plan_type, daily_limit, plan_expires_at')
+          .eq('id', user.id)
+          .single()
+        
+        if (profile) {
+          setUserPlan(profile.plan_type || 'free')
+          setDailyLimit(profile.daily_limit || 10)
+          setPlanExpires(profile.plan_expires_at ? new Date(profile.plan_expires_at) : null)
+        }
+      }
+    } catch (error) {
+      console.error('Error fetching user subscription:', error)
+    }
+  }
+
+  // Function to fetch current usage status
+  const fetchUsageStatus = async () => {
+    try {
+      const headers: Record<string, string> = {
+        "Content-Type": "application/json",
+      }
+      
+      if (user) {
+        const { data: { session } } = await supabase.auth.getSession()
+        if (session?.access_token) {
+          headers.Authorization = `Bearer ${session.access_token}`
+        }
+      } else if (guestDeviceId) {
+        // 添加设备指纹头部信息
+        headers['x-device-id'] = guestDeviceId
+        
+        // 收集并发送完整指纹（可选，用于调试和改进）
+        try {
+          const fingerprint = collectDeviceFingerprint()
+          headers['x-device-fingerprint'] = JSON.stringify(fingerprint)
+        } catch (error) {
+          console.warn("Could not collect device fingerprint:", error)
+        }
+      } else {
+        // 如果没有用户也没有设备ID，暂时不获取状态
+        console.log("[Client] Skipping usage status fetch - no user and no device ID yet")
+        return
+      }
+
+      const response = await fetch("/api/usage", {
+        headers,
+      })
+
+      if (response.ok) {
+        const data = await response.json()
+        console.log("[Client] Usage API data:", { remaining: data.remaining, isGuest: data.isGuest })
+        setRemainingCount(data.remaining || 0)
+        setIsGuest(data.isGuest === true)  // 明确检查 true 值
+        setLimitReached(data.remaining <= 0)
+        setTrackingMethod(data.trackingMethod || "unknown")
+      }
+    } catch (error) {
+      console.error("Error fetching usage status:", error)
+    }
+  }
 
   // 监听认证状态变化
   useEffect(() => {
@@ -564,7 +700,7 @@ export default function ChatPage() {
       setUser(session?.user ?? null)
       setLoading(false)
       
-      // 如果用户已登录，检查是否有使用过的性格
+      // 如果用户已登录，检查是否有使用过的性格和订阅信息
       if (session?.user) {
         try {
           const lastPersonality = await getLastUsedPersonality(session.user.id)
@@ -575,6 +711,8 @@ export default function ChatPage() {
         } catch (error) {
           console.error('Failed to get last personality:', error)
         }
+        // 获取用户订阅信息
+        fetchUserSubscription()
       }
     }
 
@@ -597,6 +735,8 @@ export default function ChatPage() {
           } catch (error) {
             console.error('Failed to get last personality:', error)
           }
+          // 获取用户订阅信息
+          fetchUserSubscription()
         }
         
         // 如果用户登出，清空本地消息
@@ -604,6 +744,9 @@ export default function ChatPage() {
           setMessages([])
           setShowPersonalitySelector(true)
           setLoadingMessages(false)
+          setRemainingCount(0)
+          setIsGuest(false)
+          setLimitReached(false)
         }
       }
     )
@@ -632,6 +775,37 @@ export default function ChatPage() {
     localStorage.setItem("ai-companion-language", language)
   }, [language])
 
+  // Auto-scroll to bottom when messages change or streaming
+  useEffect(() => {
+    const scrollToBottom = () => {
+      messagesEndRef.current?.scrollIntoView({ behavior: "smooth" })
+    }
+    
+    const timeoutId = setTimeout(scrollToBottom, 100)
+    return () => clearTimeout(timeoutId)
+  }, [messages, streamingMessage])
+
+  // Scroll to bottom when streaming starts
+  useEffect(() => {
+    if (streamingMessageId) {
+      const scrollToBottom = () => {
+        messagesEndRef.current?.scrollIntoView({ behavior: "smooth" })
+      }
+      scrollToBottom()
+    }
+  }, [streamingMessageId])
+
+  // Fetch usage status when user status changes
+  useEffect(() => {
+    if (user !== null && !showPersonalitySelector) {
+      fetchUsageStatus()
+    } else if (user === null && !showPersonalitySelector && guestDeviceId) {
+      // 确保访客设备ID已经初始化后再获取状态
+      setIsGuest(true)
+      fetchUsageStatus()
+    }
+  }, [user, showPersonalitySelector, guestDeviceId])
+
   const toggleLanguage = () => {
     const newLanguage = language === "zh" ? "en" : "zh"
     setLanguage(newLanguage)
@@ -640,12 +814,11 @@ export default function ChatPage() {
 
   const handlePersonalitySelect = async (personalityId: PersonalityType) => {
     setSelectedPersonality(personalityId)
+    setShowPersonalitySelector(false)
 
-    // 只有登录用户可以选择性格并开始聊天
+    // 根据用户状态处理性格选择
     if (user) {
-      setShowPersonalitySelector(false)
-
-      // 加载该性格的聊天记录
+      // 登录用户：加载该性格的聊天记录
       setLoadingMessages(true)
       try {
         const { messages: personalityMessages } = await loadMessagesFromSupabase(user.id, personalityId)
@@ -689,15 +862,43 @@ export default function ChatPage() {
       } finally {
         setLoadingMessages(false)
       }
+    } else {
+      // 访客用户：创建访客欢迎消息
+      const guestWelcomeMessages = {
+        gentle: {
+          zh: `您好，亲爱的朋友。我很高兴您来到这里。作为访客，您每天可以与我进行3次对话。我在这里用我的整颗心倾听您。`,
+          en: `Hello, dear friend. I'm so glad you're here. As a guest, you can have 3 conversations with me per day. I'm here to listen with my whole heart.`,
+        },
+        rational: {
+          zh: `您好，欢迎。我在这里帮助您思考和分析。作为访客用户，您今天可以与我进行3次对话。您想探索什么话题？`,
+          en: `Greetings and welcome. I'm here to help you think and analyze. As a guest user, you can have 3 conversations with me today. What would you like to explore?`,
+        },
+        lively: {
+          zh: `嘿，欢迎来到这里！我很兴奋认识您！虽然您是访客用户（每天3次对话），但我们仍然可以享受美好的交流时光！`,
+          en: `Hey there, welcome! I'm so excited to meet you! Even though you're a guest user (3 conversations per day), we can still have an amazing time chatting!`,
+        },
+      }
+
+      const welcomeMessage: Message = {
+        id: Date.now().toString(),
+        content: guestWelcomeMessages[personalityId][language],
+        sender: "ai",
+        timestamp: new Date(),
+      }
+
+      setMessages([welcomeMessage])
+      setIsGuest(true)
     }
+    
+    // 获取使用状态
+    await fetchUsageStatus()
   }
 
   const handleSendMessage = async () => {
     if (!inputValue.trim()) return
 
-    // 检查是否已登录
-    if (!user) {
-      // 可以在这里添加提示用户登录的消息
+    // Check if user has reached the limit
+    if (limitReached) {
       return
     }
 
@@ -740,29 +941,106 @@ export default function ChatPage() {
     }
 
     try {
-      const aiResponseContent = await generateAIResponse(currentInput, messages, selectedPersonality, language)
+      // Create the AI message placeholder for streaming
+      const aiMessageId = (Date.now() + 1).toString()
+      setStreamingMessageId(aiMessageId)
+      setStreamingMessage("")
+      
+      // Add initial empty AI message
+      const initialAIMessage: Message = {
+        id: aiMessageId,
+        content: "",
+        sender: "ai",
+        timestamp: new Date(),
+      }
+      setMessages((prev) => [...prev, initialAIMessage])
 
-      setTimeout(
-        async () => {
-          const aiResponse: Message = {
-            id: (Date.now() + 1).toString(),
-            content: aiResponseContent,
-            sender: "ai",
-            timestamp: new Date(),
-          }
-          setMessages((prev) => [...prev, aiResponse])
+      await generateAIResponseStream(
+        currentInput, 
+        messages, 
+        selectedPersonality, 
+        language, 
+        user, 
+        guestDeviceId,
+        // onContent callback - called for each streaming chunk
+        (content: string) => {
+          setStreamingMessage(prev => prev + content)
+          // Update the message in real-time
+          setMessages(prev => 
+            prev.map(msg => 
+              msg.id === aiMessageId 
+                ? { ...msg, content: msg.content + content }
+                : msg
+            )
+          )
+        },
+        // onComplete callback - called when streaming is done
+        async (metadata) => {
           setIsAITyping(false)
+          setStreamingMessageId(null)
+          setStreamingMessage("")
           
-          // 保存AI回复到云端
+          // Update usage counts
+          console.log("[Client] Stream completed, metadata:", metadata)
+          setRemainingCount(metadata.remaining || 0)
+          setIsGuest(metadata.isGuest === true)
+          
+          // Save final AI message to cloud
           if (user) {
-            await saveMessageToSupabase(aiResponse, user.id, selectedPersonality)
+            const finalMessage = {
+              id: aiMessageId,
+              content: "", // Will be updated with the final content
+              sender: "ai" as const,
+              timestamp: new Date(),
+            }
+            // Get the final content from the message state
+            setMessages(prev => {
+              const finalMsg = prev.find(msg => msg.id === aiMessageId)
+              if (finalMsg && finalMsg.content) {
+                saveMessageToSupabase({
+                  ...finalMessage,
+                  content: finalMsg.content
+                }, user.id, selectedPersonality)
+              }
+              return prev
+            })
           }
         },
-        1500 + Math.random() * 1000,
+        // onError callback - called if there's an error
+        (error: string) => {
+          console.error("Streaming error:", error)
+          setIsAITyping(false)
+          setStreamingMessageId(null)
+          setStreamingMessage("")
+          
+          // Check if it's a rate limit error
+          if (error.includes("今日对话次数已用完") || error.includes("Rate limit") || error.includes("limit")) {
+            setLimitReached(true)
+            // Update the AI message with error content
+            setMessages(prev => 
+              prev.map(msg => 
+                msg.id === aiMessageId 
+                  ? { ...msg, content: error }
+                  : msg
+              )
+            )
+          } else {
+            // Replace the empty message with error message
+            setMessages(prev => 
+              prev.map(msg => 
+                msg.id === aiMessageId 
+                  ? { ...msg, content: language === "zh" ? "抱歉，我现在无法回复。请稍后再试。" : "Sorry, I cannot reply right now. Please try again later." }
+                  : msg
+              )
+            )
+          }
+        }
       )
     } catch (error) {
       console.error("Error generating AI response:", error)
       setIsAITyping(false)
+      setStreamingMessageId(null)
+      setStreamingMessage("")
     }
   }
 
@@ -896,7 +1174,18 @@ export default function ChatPage() {
     return (
       <div className="min-h-screen bg-gradient-to-br from-rose-50 via-orange-50 to-amber-50 dark:from-rose-950/20 dark:via-orange-950/20 dark:to-amber-950/20 flex items-center justify-center p-6">
         <Card className="w-full max-w-2xl p-8 bg-white/80 dark:bg-rose-950/50 backdrop-blur-sm border-rose-200 dark:border-rose-800">
-          <div className="flex justify-end mb-4">
+          <div className="flex justify-end gap-2 mb-4">
+            {/* 价格页面入口 */}
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => window.location.href = '/pricing'}
+              className="border-purple-200 dark:border-purple-800 text-purple-600 dark:text-purple-300 hover:bg-purple-50 dark:hover:bg-purple-950/50 bg-transparent"
+            >
+              <Crown className="w-4 h-4 mr-2" />
+              {language === "zh" ? "升级套餐" : "Upgrade"}
+            </Button>
+            
             <Button
               variant="outline"
               size="sm"
@@ -968,55 +1257,63 @@ export default function ChatPage() {
             </p>
           </div>
 
-          {user ? (
-            <div className="grid gap-4">
-              {personalities.map((personality) => (
-                <Card
-                  key={personality.id}
-                  className="p-6 cursor-pointer transition-all hover:shadow-md border-2 border-transparent hover:border-rose-200 dark:hover:border-rose-700"
-                  onClick={() => handlePersonalitySelect(personality.id)}
-                >
-                  <div className="flex items-start gap-4">
-                    <div
-                      className={`w-12 h-12 bg-gradient-to-br ${
-                        personality.color === "rose"
-                          ? "from-rose-400 to-pink-400"
-                          : personality.color === "blue"
-                            ? "from-blue-400 to-indigo-400"
-                            : "from-amber-400 to-orange-400"
-                      } rounded-full flex items-center justify-center text-white`}
-                    >
-                      {personality.icon}
-                    </div>
-                    <div className="flex-1">
-                      <h3 className="font-semibold text-rose-900 dark:text-rose-100 mb-1">
-                        {personality.name[language]}
-                      </h3>
-                      <p className="text-sm text-rose-600 dark:text-rose-300 leading-relaxed">
-                        {personality.description[language]}
-                      </p>
-                    </div>
-                  </div>
-                </Card>
-              ))}
-            </div>
-          ) : (
-            <div className="text-center py-8">
-              <div className="w-16 h-16 bg-gradient-to-br from-rose-400 to-orange-400 rounded-full flex items-center justify-center mx-auto mb-4 opacity-50">
-                <LogIn className="w-8 h-8 text-white" />
-              </div>
-              <p className="text-sm text-rose-600 dark:text-rose-300 mb-4">
-                {language === "zh" 
-                  ? "请先登录Google账户以选择AI性格并开始聊天" 
-                  : "Please sign in with your Google account to select an AI personality and start chatting"}
-              </p>
-              <Button
-                onClick={signInWithGoogle}
-                className="bg-gradient-to-r from-rose-500 to-orange-500 hover:from-rose-600 hover:to-orange-600 text-white"
+          <div className="grid gap-4">
+            {personalities.map((personality) => (
+              <Card
+                key={personality.id}
+                className="p-6 cursor-pointer transition-all hover:shadow-md border-2 border-transparent hover:border-rose-200 dark:hover:border-rose-700"
+                onClick={() => handlePersonalitySelect(personality.id)}
               >
-                <LogIn className="w-4 h-4 mr-2" />
-                {language === "zh" ? "Google 登录" : "Google Sign In"}
-              </Button>
+                <div className="flex items-start gap-4">
+                  <div
+                    className={`w-12 h-12 bg-gradient-to-br ${
+                      personality.color === "rose"
+                        ? "from-rose-400 to-pink-400"
+                        : personality.color === "blue"
+                          ? "from-blue-400 to-indigo-400"
+                          : "from-amber-400 to-orange-400"
+                    } rounded-full flex items-center justify-center text-white`}
+                  >
+                    {personality.icon}
+                  </div>
+                  <div className="flex-1">
+                    <h3 className="font-semibold text-rose-900 dark:text-rose-100 mb-1">
+                      {personality.name[language]}
+                    </h3>
+                    <p className="text-sm text-rose-600 dark:text-rose-300 leading-relaxed">
+                      {personality.description[language]}
+                    </p>
+                  </div>
+                </div>
+              </Card>
+            ))}
+          </div>
+          
+          {!user && (
+            <div className="mt-6 p-4 bg-amber-50 dark:bg-amber-950/20 border border-amber-200 dark:border-amber-800 rounded-lg">
+              <div className="flex items-start gap-3">
+                <div className="w-8 h-8 bg-gradient-to-br from-amber-400 to-orange-400 rounded-full flex items-center justify-center flex-shrink-0">
+                  <Users className="w-4 h-4 text-white" />
+                </div>
+                <div className="flex-1">
+                  <h4 className="text-sm font-medium text-amber-800 dark:text-amber-200 mb-1">
+                    {language === "zh" ? "访客模式" : "Guest Mode"}
+                  </h4>
+                  <p className="text-xs text-amber-700 dark:text-amber-300 mb-3">
+                    {language === "zh" 
+                      ? "作为访客，您每天可以进行3次对话。登录后可享受每天10次对话！" 
+                      : "As a guest, you can have 3 conversations per day. Sign in for 10 daily conversations!"}
+                  </p>
+                  <Button
+                    onClick={signInWithGoogle}
+                    size="sm"
+                    className="bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-600 hover:to-orange-600 text-white"
+                  >
+                    <LogIn className="w-3 h-3 mr-2" />
+                    {language === "zh" ? "登录获取更多" : "Sign In for More"}
+                  </Button>
+                </div>
+              </div>
             </div>
           )}
         </Card>
@@ -1046,6 +1343,67 @@ export default function ChatPage() {
                 {currentPersonality.name[language]}
               </h1>
               <p className="text-sm text-rose-600 dark:text-rose-300">{currentPersonality.description[language]}</p>
+              <div className="flex items-center gap-2 mt-1 flex-wrap">
+                {/* 对话次数显示 */}
+                <div className={`text-xs px-2 py-1 rounded-full ${
+                  limitReached ? 'bg-red-100 text-red-700' : 
+                  remainingCount <= 1 ? 'bg-yellow-100 text-yellow-700' : 
+                  'bg-green-100 text-green-700'
+                }`}>
+                  {language === "zh" 
+                    ? `剩余 ${remainingCount}/${isGuest ? 3 : dailyLimit || 10} 次对话` 
+                    : `${remainingCount}/${isGuest ? 3 : dailyLimit || 10} conversations left`}
+                </div>
+
+                {/* 用户状态显示 */}
+                {isGuest ? (
+                  <div className="text-xs text-rose-500">
+                    {language === "zh" ? "访客模式" : "Guest Mode"}
+                    {trackingMethod === "device_fingerprint" && (
+                      <span className="ml-1 text-green-600">🔐</span>
+                    )}
+                  </div>
+                ) : (
+                  <div className="flex items-center gap-2">
+                    {/* 套餐状态显示 */}
+                    <div className={`text-xs px-2 py-1 rounded-full ${
+                      userPlan === 'lifetime' ? 'bg-yellow-100 text-yellow-700' :
+                      userPlan === 'monthly' ? 'bg-blue-100 text-blue-700' :
+                      'bg-gray-100 text-gray-700'
+                    }`}>
+                      {userPlan === 'lifetime' ? (language === "zh" ? "永久版" : "Lifetime") :
+                       userPlan === 'monthly' ? (language === "zh" ? "月订版" : "Monthly") :
+                       (language === "zh" ? "免费版" : "Free")}
+                    </div>
+                    
+                    {/* 过期时间显示 */}
+                    {planExpires && userPlan === 'monthly' && (
+                      <div className="text-xs text-gray-500">
+                        {language === "zh" ? "过期：" : "Expires: "}
+                        {planExpires.toLocaleDateString()}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* 升级按钮 */}
+                {(limitReached || remainingCount <= 2) && (userPlan === 'free' || isGuest) && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => {
+                      if (!user) {
+                        window.location.href = '/auth?redirect=pricing'
+                      } else {
+                        window.location.href = '/pricing'
+                      }
+                    }}
+                    className="text-xs h-6 px-2 bg-gradient-to-r from-purple-600 to-pink-600 text-white border-0 hover:from-purple-700 hover:to-pink-700"
+                  >
+                    {language === "zh" ? "升级获取更多次数" : "Upgrade for More"}
+                  </Button>
+                )}
+              </div>
             </div>
           </div>
 
@@ -1071,6 +1429,17 @@ export default function ChatPage() {
                 </Button>
               </div>
             )}
+
+            {/* 价格页面入口 */}
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => window.location.href = '/pricing'}
+              className="mr-2 border-purple-200 dark:border-purple-800 text-purple-600 dark:text-purple-300 hover:bg-purple-50 dark:hover:bg-purple-950/50 bg-transparent"
+            >
+              <Crown className="w-4 h-4 mr-1" />
+              <span className="hidden sm:inline">{language === "zh" ? "升级套餐" : "Upgrade"}</span>
+            </Button>
 
             {!user && !loading && (
               <Button
@@ -1114,6 +1483,36 @@ export default function ChatPage() {
             </Button>
           </div>
         </div>
+
+        {/* Guest Mode Banner */}
+        {isGuest && !showPersonalitySelector && (
+          <div className="mx-6 mt-4 p-3 bg-gradient-to-r from-amber-50 to-orange-50 dark:from-amber-950/20 dark:to-orange-950/20 border border-amber-200 dark:border-amber-800 rounded-lg">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <div className="w-6 h-6 bg-gradient-to-br from-amber-400 to-orange-400 rounded-full flex items-center justify-center">
+                  <Users className="w-3 h-3 text-white" />
+                </div>
+                <span className="text-sm font-medium text-amber-800 dark:text-amber-200">
+                  {language === "zh" ? "访客模式" : "Guest Mode"}
+                </span>
+                <span className="text-xs text-amber-600 dark:text-amber-400">
+                  {language === "zh" 
+                    ? `今日剩余 ${remainingCount}/3 次对话` 
+                    : `${remainingCount}/3 conversations left today`}
+                </span>
+              </div>
+              <Button
+                onClick={signInWithGoogle}
+                size="sm"
+                variant="outline"
+                className="text-xs border-amber-300 text-amber-700 hover:bg-amber-100 dark:border-amber-700 dark:text-amber-300 dark:hover:bg-amber-900/20"
+              >
+                <LogIn className="w-3 h-3 mr-1" />
+                {language === "zh" ? "登录" : "Sign In"}
+              </Button>
+            </div>
+          </div>
+        )}
 
         {/* Chat Messages */}
         <div className="flex-1 overflow-y-auto p-6 space-y-4">
@@ -1161,6 +1560,10 @@ export default function ChatPage() {
                     }`}
                   >
                     {message.content}
+                    {/* 添加流式输入时的光标指示器 */}
+                    {message.sender === "ai" && streamingMessageId === message.id && (
+                      <span className="inline-block w-2 h-4 bg-rose-500 dark:bg-rose-400 ml-1 animate-pulse"></span>
+                    )}
                   </p>
 
                   {message.sender === "ai" && (
@@ -1235,34 +1638,69 @@ export default function ChatPage() {
               </Card>
             </div>
           )}
+          
+          {/* Scroll anchor for auto-scrolling */}
+          <div ref={messagesEndRef} />
         </div>
 
         {/* Input Area */}
         <div className="p-6 border-t border-rose-200/50 dark:border-rose-800/30 bg-white/50 dark:bg-rose-950/20 backdrop-blur-sm">
-          {!user ? (
-            // 未登录时显示登录提示
+          {limitReached ? (
+            // 达到使用限制时显示提示
             <div className="text-center py-8">
-              <div className="w-16 h-16 bg-gradient-to-br from-rose-400 to-orange-400 rounded-full flex items-center justify-center mx-auto mb-4 opacity-50">
-                <LogIn className="w-8 h-8 text-white" />
+              <div className="w-16 h-16 bg-gradient-to-br from-red-400 to-red-500 rounded-full flex items-center justify-center mx-auto mb-4">
+                <Users className="w-8 h-8 text-white" />
               </div>
               <h3 className="text-lg font-medium text-rose-900 dark:text-rose-100 mb-2">
-                {language === "zh" ? "请先登录" : "Please Sign In First"}
+                {language === "zh" ? "今日对话次数已用完" : "Daily Chat Limit Reached"}
               </h3>
               <p className="text-sm text-rose-600 dark:text-rose-300 mb-4">
-                {language === "zh" 
-                  ? "使用Google账户登录后即可开始与AI聊天" 
-                  : "Sign in with your Google account to start chatting with AI"}
+                {isGuest ? (
+                  language === "zh" 
+                    ? "访客每天可进行3次对话。升级套餐享受100次/天对话！" 
+                    : "Guests can have 3 conversations per day. Upgrade for 100 conversations daily!"
+                ) : userPlan === 'free' ? (
+                  language === "zh"
+                    ? "免费用户每天可进行10次对话。升级套餐享受100次/天对话！"
+                    : "Free users get 10 conversations daily. Upgrade for 100 conversations!"
+                ) : (
+                  language === "zh"
+                    ? "您今日的对话已用完，明天将自动重置。"
+                    : "You've used your daily conversations. They will reset tomorrow."
+                )}
               </p>
-              <Button
-                onClick={signInWithGoogle}
-                className="bg-gradient-to-r from-rose-500 to-orange-500 hover:from-rose-600 hover:to-orange-600 text-white"
-              >
-                <LogIn className="w-4 h-4 mr-2" />
-                {language === "zh" ? "Google 登录" : "Google Sign In"}
-              </Button>
+              
+              <div className="flex gap-2 justify-center">
+                {isGuest && (
+                  <Button
+                    onClick={signInWithGoogle}
+                    className="bg-gradient-to-r from-rose-500 to-orange-500 hover:from-rose-600 hover:to-orange-600 text-white"
+                  >
+                    <LogIn className="w-4 h-4 mr-2" />
+                    {language === "zh" ? "登录解锁更多对话" : "Sign In for More Chats"}
+                  </Button>
+                )}
+                
+                {/* 升级套餐按钮 - 针对访客和免费用户 */}
+                {(isGuest || userPlan === 'free') && (
+                  <Button
+                    onClick={() => {
+                      if (!user) {
+                        window.location.href = '/auth?redirect=pricing'
+                      } else {
+                        window.location.href = '/pricing'
+                      }
+                    }}
+                    className="bg-gradient-to-r from-purple-500 to-pink-500 hover:from-purple-600 hover:to-pink-600 text-white"
+                  >
+                    <Crown className="w-4 h-4 mr-2" />
+                    {language === "zh" ? "升级套餐" : "Upgrade Plan"}
+                  </Button>
+                )}
+              </div>
             </div>
           ) : (
-            // 已登录时显示输入框
+            // 显示输入框（登录用户和访客都可以使用）
             <>
               <div className="flex gap-3 items-end">
                 <div className="flex-1">
@@ -1270,22 +1708,61 @@ export default function ChatPage() {
                     value={inputValue}
                     onChange={(e) => setInputValue(e.target.value)}
                     onKeyPress={handleKeyPress}
-                    placeholder={t.shareThoughts}
+                    placeholder={limitReached ? (language === "zh" ? "今日对话次数已用完" : "Daily limit reached") : t.shareThoughts}
                     className="border-rose-200 dark:border-rose-800 focus:border-rose-400 dark:focus:border-rose-600 bg-white dark:bg-rose-950/50 text-rose-900 dark:text-rose-100 placeholder:text-rose-400 dark:placeholder:text-rose-500"
-                    disabled={isAITyping || isRateLimited}
+                    disabled={isAITyping || isRateLimited || limitReached || streamingMessageId !== null}
                   />
                 </div>
                 <Button
                   onClick={handleSendMessage}
-                  disabled={!inputValue.trim() || isAITyping || isRateLimited}
+                  disabled={!inputValue.trim() || isAITyping || isRateLimited || limitReached || streamingMessageId !== null}
                   className="bg-gradient-to-r from-rose-500 to-orange-500 hover:from-rose-600 hover:to-orange-600 text-white border-0 px-4 py-2"
                 >
-                  <Send className="w-4 h-4" />
+                  {streamingMessageId ? (
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                  ) : (
+                    <Send className="w-4 h-4" />
+                  )}
                 </Button>
               </div>
-              <p className="text-xs text-rose-500 dark:text-rose-400 mt-2 text-center">
-                {isRateLimited ? t.rateLimit : t.pressEnter}
-              </p>
+              <div className="flex justify-between items-center mt-2">
+                <p className="text-xs text-rose-500 dark:text-rose-400">
+                  {limitReached ? (
+                    language === "zh" ? "今日对话次数已用完" : "Daily limit reached"
+                  ) : isRateLimited ? (
+                    t.rateLimit
+                  ) : (
+                    t.pressEnter
+                  )}
+                </p>
+                {!limitReached && (
+                  <div className="flex items-center gap-2">
+                    <p className="text-xs text-rose-400">
+                      {language === "zh" 
+                        ? `剩余 ${remainingCount} 次` 
+                        : `${remainingCount} left`}
+                    </p>
+                    {/* 当剩余次数较少且为免费用户或访客时，显示升级提示 */}
+                    {remainingCount <= 2 && (isGuest || userPlan === 'free') && (
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => {
+                          if (!user) {
+                            window.location.href = '/auth?redirect=pricing'
+                          } else {
+                            window.location.href = '/pricing'
+                          }
+                        }}
+                        className="text-xs h-5 px-2 text-purple-600 hover:text-purple-700 hover:bg-purple-50 dark:text-purple-400 dark:hover:text-purple-300 dark:hover:bg-purple-950/50"
+                      >
+                        <Crown className="w-3 h-3 mr-1" />
+                        {language === "zh" ? "升级" : "Upgrade"}
+                      </Button>
+                    )}
+                  </div>
+                )}
+              </div>
             </>
           )}
         </div>

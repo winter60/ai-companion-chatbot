@@ -1,11 +1,25 @@
 import { type NextRequest, NextResponse } from "next/server"
+import { createSupabaseServerClient } from "@/lib/supabaseServer"
 
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
-async function callOpenRouterWithRetry(messages: any[], maxRetries = 3) {
+// Helper function to get client IP address
+function getClientIP(request: NextRequest): string | null {
+  const forwarded = request.headers.get('x-forwarded-for')
+  const real = request.headers.get('x-real-ip')
+  const cfConnectingIP = request.headers.get('cf-connecting-ip')
+  
+  if (cfConnectingIP) return cfConnectingIP
+  if (forwarded) return forwarded.split(',')[0].trim()
+  if (real) return real
+  
+  return request.ip || null
+}
+
+async function callOpenRouterWithStreamRetry(messages: any[], maxRetries = 3): Promise<Response> {
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
-      console.log(`[v0] Attempting OpenRouter API call, attempt ${attempt}`)
+      console.log(`[v0] Attempting OpenRouter streaming API call, attempt ${attempt}`)
 
       const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
         method: "POST",
@@ -18,6 +32,7 @@ async function callOpenRouterWithRetry(messages: any[], maxRetries = 3) {
           messages: messages,
           temperature: 0.7,
           max_tokens: 500,
+          stream: true,
         }),
       })
 
@@ -40,9 +55,8 @@ async function callOpenRouterWithRetry(messages: any[], maxRetries = 3) {
         throw new Error(`OpenRouter API error: ${response.status}`)
       }
 
-      const data = await response.json()
-      console.log(`[v0] OpenRouter API success, response length: ${data.choices[0]?.message?.content?.length || 0}`)
-      return data
+      console.log(`[v0] OpenRouter streaming API success`)
+      return response
     } catch (error) {
       console.log(`[v0] Error in attempt ${attempt}:`, error)
       if (attempt === maxRetries) {
@@ -51,6 +65,7 @@ async function callOpenRouterWithRetry(messages: any[], maxRetries = 3) {
       await delay(3000)
     }
   }
+  throw new Error("All retry attempts failed")
 }
 
 export async function POST(request: NextRequest) {
@@ -62,6 +77,96 @@ export async function POST(request: NextRequest) {
     console.log(
       `[v0] Request params - personality: ${personality}, language: ${language}, message length: ${message?.length || 0}`,
     )
+
+    // Get authorization header to check if user is logged in
+    const authHeader = request.headers.get('authorization')
+    const accessToken = authHeader?.replace('Bearer ', '')
+    
+    let usageResult: any = null
+    let isLoggedIn = false
+    
+    if (accessToken) {
+      // User is potentially logged in, check with Supabase
+      const supabase = createSupabaseServerClient(accessToken)
+      
+      try {
+        const { data: { user }, error: userError } = await supabase.auth.getUser()
+        
+        if (user && !userError) {
+          isLoggedIn = true
+          console.log("[v0] Logged-in user detected, checking conversation limits")
+          
+          // Call updated RPC function to check and increment conversation count (with subscription support)
+          const { data, error } = await supabase.rpc('check_user_conversation_limit_v2', {
+            p_user_id: user.id
+          })
+          
+          if (error) {
+            console.error("[v0] RPC Error:", error)
+            return NextResponse.json({ error: '服务器内部错误' }, { status: 500 })
+          }
+          
+          usageResult = data
+          
+          if (!data.success) {
+            return NextResponse.json({
+              error: data.message,
+              limitReached: true,
+              remaining: data.remaining_count
+            }, { status: 429 })
+          }
+        }
+      } catch (error) {
+        console.log("[v0] Auth check failed, treating as guest")
+      }
+    }
+    
+    if (!isLoggedIn) {
+      // Handle guest user
+      const clientIP = getClientIP(request)
+      const deviceId = request.headers.get('x-device-id')
+      const userAgent = request.headers.get('user-agent')
+      const deviceFingerprint = request.headers.get('x-device-fingerprint')
+      
+      if (!deviceId) {
+        return NextResponse.json({ error: '缺少设备标识，请刷新页面重试' }, { status: 400 })
+      }
+      
+      console.log("[v0] Guest user detected, checking conversation limits for device:", deviceId.substring(0, 16) + '...')
+      
+      // Use service role client for guest operations
+      const supabase = createSupabaseServerClient()
+      const { data, error } = await supabase.rpc('check_guest_conversation_limit_v2', { 
+        client_device_id: deviceId,
+        client_ip: clientIP,
+        client_user_agent: userAgent,
+        client_fingerprint: deviceFingerprint
+      })
+      
+      if (error) {
+        console.error("[v0] Guest RPC Error:", error)
+        // 降级到旧版本IP追踪
+        console.log("[v0] Falling back to IP-based tracking")
+        const fallbackResult = await supabase.rpc('check_guest_conversation_limit', { client_ip: clientIP })
+        
+        if (fallbackResult.error) {
+          return NextResponse.json({ error: '服务器内部错误' }, { status: 500 })
+        }
+        
+        usageResult = fallbackResult.data
+      } else {
+        usageResult = data
+      }
+      
+      if (!usageResult.success) {
+        return NextResponse.json({
+          error: usageResult.message,
+          limitReached: true,
+          remaining: usageResult.remaining_count || 0,
+          isGuest: true
+        }, { status: 429 })
+      }
+    }
 
     // 根据人格类型创建系统提示
     const personalityPrompts = {
@@ -97,11 +202,84 @@ export async function POST(request: NextRequest) {
     ]
 
     console.log(`[v0] Calling OpenRouter with ${messages.length} messages`)
-    const data = await callOpenRouterWithRetry(messages)
-    const aiResponse = data.choices[0]?.message?.content || "抱歉，我现在无法回复。请稍后再试。"
+    const response = await callOpenRouterWithStreamRetry(messages)
+    
+    // Create a ReadableStream to handle the streaming response
+    const stream = new ReadableStream({
+      async start(controller) {
+        const encoder = new TextEncoder()
+        
+        try {
+          const reader = response.body?.getReader()
+          if (!reader) {
+            throw new Error('No response body')
+          }
 
-    console.log(`[v0] Returning AI response, length: ${aiResponse.length}`)
-    return NextResponse.json({ response: aiResponse })
+          let buffer = ''
+          
+          while (true) {
+            const { done, value } = await reader.read()
+            
+            if (done) {
+              // Send final metadata
+              const finalData = {
+                type: 'metadata',
+                remaining: usageResult?.remaining_count || 0,
+                isGuest: !isLoggedIn
+              }
+              controller.enqueue(encoder.encode(`data: ${JSON.stringify(finalData)}\n\n`))
+              controller.close()
+              break
+            }
+
+            buffer += new TextDecoder().decode(value)
+            const lines = buffer.split('\n')
+            buffer = lines.pop() || ''
+
+            for (const line of lines) {
+              if (line.trim().startsWith('data: ')) {
+                const data = line.replace('data: ', '').trim()
+                
+                if (data === '[DONE]') {
+                  continue
+                }
+
+                try {
+                  const parsed = JSON.parse(data)
+                  const content = parsed.choices?.[0]?.delta?.content
+                  
+                  if (content) {
+                    const streamData = {
+                      type: 'content',
+                      content: content
+                    }
+                    controller.enqueue(encoder.encode(`data: ${JSON.stringify(streamData)}\n\n`))
+                  }
+                } catch (parseError) {
+                  console.error('Parse error:', parseError)
+                }
+              }
+            }
+          }
+        } catch (error) {
+          console.error('Stream processing error:', error)
+          const errorData = {
+            type: 'error',
+            error: '抱歉，我现在无法回复。请稍后再试。'
+          }
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify(errorData)}\n\n`))
+          controller.close()
+        }
+      }
+    })
+
+    return new Response(stream, {
+      headers: {
+        'Content-Type': 'text/plain; charset=utf-8',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+      },
+    })
   } catch (error) {
     console.error("[v0] Chat API error:", error)
 

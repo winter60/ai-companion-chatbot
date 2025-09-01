@@ -25,3 +25,22 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# development & testing files
+/scripts/debug/
+/scripts/tests/
+/docs/development/
+*.test.local.js
+*.debug.js
+*-test-*.js
+debug-*.js
+quick-test*.js
+
+# database fixes & migrations (keep tracked but exclude sensitive ones)
+# Add specific files to exclude if they contain sensitive data
+# Example: fix-production-*.sql
+
+# temporary files
+temp-*
+tmp-*
+*.tmp
