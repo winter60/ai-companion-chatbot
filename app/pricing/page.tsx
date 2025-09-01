@@ -95,7 +95,7 @@ const plans: Plan[] = [
     ],
     icon: <Zap className="h-6 w-6" />,
     popular: true,
-    creemProductId: "prod_4d5HDu2UIJi1sTRb2IMvDE",
+    creemProductId: process.env.NEXT_PUBLIC_CREEM_MONTHLY_PRODUCT_ID,
     buttonText: "立即订阅",
     buttonTextEn: "Subscribe Now",
     buttonVariant: "default"
@@ -127,7 +127,7 @@ const plans: Plan[] = [
       { included: true, text: "Lifetime access" }
     ],
     icon: <Crown className="h-6 w-6" />,
-    creemProductId: "prod_1p1RujKUJPUS4WXAmRcZ48",
+    creemProductId: process.env.NEXT_PUBLIC_CREEM_LIFETIME_PRODUCT_ID,
     buttonText: "终身购买",
     buttonTextEn: "Buy Lifetime",
     buttonVariant: "default"
