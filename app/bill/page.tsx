@@ -3,7 +3,7 @@
 import { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { supabase } from '@/lib/supabaseClient';
-import { DocumentText, Calendar, CreditCard, CheckCircle, XCircle, Clock, ArrowLeft } from 'lucide-react';
+import { FileText, Calendar, CreditCard, CheckCircle, XCircle, Clock, ArrowLeft } from 'lucide-react';
 
 interface Payment {
   id: string;
@@ -159,7 +159,7 @@ export default function BillPage() {
               </button>
               <div>
                 <h1 className="text-2xl font-bold text-gray-900 flex items-center">
-                  <DocumentText className="h-8 w-8 mr-3 text-blue-600" />
+                  <FileText className="h-8 w-8 mr-3 text-blue-600" />
                   账单历史
                 </h1>
                 <p className="text-gray-600 mt-1">查看您的所有支付记录</p>
@@ -215,7 +215,7 @@ export default function BillPage() {
 
           {payments.length === 0 ? (
             <div className="p-12 text-center">
-              <DocumentText className="h-12 w-12 text-gray-400 mx-auto mb-4" />
+              <FileText className="h-12 w-12 text-gray-400 mx-auto mb-4" />
               <h3 className="text-lg font-medium text-gray-900 mb-2">暂无支付记录</h3>
               <p className="text-gray-600 mb-6">您还没有任何支付记录</p>
               <button
