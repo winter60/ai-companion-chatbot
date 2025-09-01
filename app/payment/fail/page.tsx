@@ -1,11 +1,11 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useState, Suspense } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { XCircle, Home, CreditCard } from 'lucide-react';
 import Link from 'next/link';
 
-export default function PaymentFailPage() {
+function PaymentFailContent() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const [failureReason, setFailureReason] = useState<string>('');
@@ -132,5 +132,20 @@ export default function PaymentFailPage() {
         </div>
       </div>
     </div>
+  );
+}
+
+export default function PaymentFailPage() {
+  return (
+    <Suspense fallback={
+      <div className="min-h-screen flex items-center justify-center bg-gray-50">
+        <div className="bg-white p-8 rounded-lg shadow-lg text-center max-w-md">
+          <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600 mx-auto mb-4"></div>
+          <p className="text-gray-600">加载中...</p>
+        </div>
+      </div>
+    }>
+      <PaymentFailContent />
+    </Suspense>
   );
 }
