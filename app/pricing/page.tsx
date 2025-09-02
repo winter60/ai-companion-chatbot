@@ -41,7 +41,7 @@ const plans: Plan[] = [
     name: "免费版",
     nameEn: "Free",
     price: 0,
-    priceDisplay: "¥0",
+    priceDisplay: "$0",
     period: "永久免费",
     periodEn: "Forever Free",
     description: "体验基础AI情感陪伴功能",
@@ -72,7 +72,7 @@ const plans: Plan[] = [
     name: "月订版",
     nameEn: "Monthly",
     price: 9.9,
-    priceDisplay: "¥9.9",
+    priceDisplay: "$9.9",
     period: "30天",
     periodEn: "30 Days",
     description: "适合短期深度体验用户",
@@ -105,7 +105,7 @@ const plans: Plan[] = [
     name: "永久版",
     nameEn: "Lifetime",
     price: 99,
-    priceDisplay: "¥99",
+    priceDisplay: "$99",
     period: "一次付费永久使用",
     periodEn: "One-time Payment",
     description: "最佳性价比，长期陪伴之选",
@@ -436,7 +436,7 @@ export default function PricingPage() {
               </h3>
               <p className="text-gray-600 text-sm">
                 {language === "zh" 
-                  ? "付费用户享有优先客服支持。如遇问题，可通过应用内反馈或邮件联系我们。"
+                  ? "付费用户享有优先客服支持。如遇问题，可通过应用内反馈或邮件6liulin@gmail.com联系我们。"
                   : "Premium users enjoy priority customer support. If you encounter any issues, you can contact us through in-app feedback or email."
                 }
               </p>
